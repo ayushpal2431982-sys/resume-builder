@@ -5,54 +5,75 @@ import pdfParse from "pdf-parse";
 import { pdfToPng } from 'pdf-to-png-converter';
 import Tesseract from 'tesseract.js';
 
+// ✅ GROQ-OPTIMIZED: Minimal delay (Groq is very fast and has good limits)
+let lastAPICall = 0;
+const MIN_DELAY_BETWEEN_CALLS = 2000; // 2 seconds (safe for 30/min limit)
+
+// ✅ GROQ-OPTIMIZED: Fast retry with short delays
+async function callAIWithRetry(messages, maxRetries = 3, initialDelay = 3000) {
+  const now = Date.now();
+  const timeSinceLastCall = now - lastAPICall;
+  if (timeSinceLastCall < MIN_DELAY_BETWEEN_CALLS) {
+    const waitTime = MIN_DELAY_BETWEEN_CALLS - timeSinceLastCall;
+    await new Promise(resolve => setTimeout(resolve, waitTime));
+  }
+  lastAPICall = Date.now();
+  
+  let lastError;
+  
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`  📡 API Call - Attempt ${attempt}/${maxRetries}...`);
+      
+      const aiResponse = await ai.chat.completions.create({
+        model: process.env.OPENAI_MODEL || "llama-3.3-70b-versatile",
+        messages: messages,
+        temperature: 0.2,
+        max_tokens: 2000,
+      });
+      
+      console.log(`  ✅ Success!`);
+      return aiResponse;
+      
+    } catch (error) {
+      lastError = error;
+      
+      const is429 = error.status === 429 || 
+                    error.message?.includes('429') || 
+                    error.message?.includes('rate limit');
+      
+      if (is429 && attempt < maxRetries) {
+        const delay = initialDelay * Math.pow(2, attempt - 1); // 3s, 6s, 12s
+        console.log(`  ⚠️ Rate limit. Waiting ${(delay/1000)}s...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else if (attempt >= maxRetries) {
+        console.log(`  ❌ All retries exhausted`);
+        throw lastError;
+      } else {
+        console.log(`  ❌ Error: ${error.message}`);
+        throw error;
+      }
+    }
+  }
+  
+  throw lastError;
+}
+
 async function extractTextWithOCR(pdfPath) {
-  console.log("👁️ Using Tesseract OCR for text extraction...");
+  console.log("👁️ OCR extraction...");
   
   try {
-    const pngPages = await pdfToPng(pdfPath, {
-      viewportScale: 2.0,
-    });
-    
-    if (pngPages.length === 0) {
-      throw new Error("No pages found in PDF");
-    }
-    
-    console.log(`  ✓ Converted ${pngPages.length} page(s) to images`);
+    const pngPages = await pdfToPng(pdfPath, { viewportScale: 2.0 });
+    if (pngPages.length === 0) throw new Error("No pages");
     
     let allText = "";
-    
     for (let i = 0; i < Math.min(pngPages.length, 2); i++) {
-      console.log(`  📄 Processing page ${i + 1}...`);
-      
-      const imageBuffer = pngPages[i].content;
-      
-      const { data: { text } } = await Tesseract.recognize(
-        imageBuffer,
-        'eng',
-        {
-          logger: (m) => {
-            if (m.status === 'recognizing text') {
-              const progress = Math.round(m.progress * 100);
-              if (progress % 25 === 0) {
-                console.log(`    Progress: ${progress}%`);
-              }
-            }
-          }
-        }
-      );
-      
+      const { data: { text } } = await Tesseract.recognize(pngPages[i].content, 'eng');
       allText += text + "\n\n";
-      console.log(`  ✓ Page ${i + 1} completed (${text.length} characters)`);
     }
     
-    console.log("✓ OCR extraction successful!");
-    console.log(`  Total extracted: ${allText.length} characters`);
-    console.log("  First 300 chars:", allText.substring(0, 300));
-    
     return allText.trim();
-    
   } catch (error) {
-    console.error("❌ OCR Error:", error.message);
     throw error;
   }
 }
@@ -64,32 +85,19 @@ export const uploadResume = async (req, res) => {
     const userId = req.userId;
     const { title } = req.body;
 
-    console.log("User ID:", userId);
-    console.log("Title:", title);
-    console.log("File:", req.file ? req.file.originalname : "NO FILE");
-    
     if (!req.file) {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Please select a PDF file" 
-      });
+      return res.status(400).json({ success: false, message: "Select a PDF file" });
     }
     
     if (!title || title.trim() === "") {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Please enter a resume title" 
-      });
+      return res.status(400).json({ success: false, message: "Enter a title" });
     }
 
     if (req.file.mimetype !== 'application/pdf') {
-      return res.status(400).json({ 
-        success: false, 
-        message: "Only PDF files are allowed" 
-      });
+      return res.status(400).json({ success: false, message: "PDF only" });
     }
 
-    console.log("📄 Step 1: Attempting normal PDF text extraction...");
+    console.log("📄 Extracting text...");
     let extractedText = "";
     let pdfPageCount = 0;
     
@@ -98,37 +106,21 @@ export const uploadResume = async (req, res) => {
       const pdfData = await pdfParse(dataBuffer);
       extractedText = pdfData.text;
       pdfPageCount = pdfData.numpages;
-      
-      console.log("✓ PDF text extraction completed");
-      console.log("  Pages:", pdfPageCount);
-      console.log("  Text length:", extractedText.length, "characters");
-      
-      if (extractedText.length > 100) {
-        console.log("  First 200 chars:", extractedText.substring(0, 200));
-      }
-      
+      console.log(`✓ ${extractedText.length} chars from ${pdfPageCount} pages`);
     } catch (parseError) {
-      console.error("⚠️ Normal PDF parsing failed:", parseError.message);
+      console.error("⚠️ PDF parse failed");
     }
 
     if (!extractedText || extractedText.trim().length < 50) {
-      console.log("\n⚠️ Not enough text extracted (only", extractedText.length, "chars)");
-      console.log("📸 Step 2: Attempting OCR extraction...\n");
-      
+      console.log("📸 Trying OCR...");
       try {
         extractedText = await extractTextWithOCR(req.file.path);
-        
         if (!extractedText || extractedText.trim().length < 50) {
-          throw new Error("OCR extracted less than 50 characters");
+          throw new Error("Insufficient text");
         }
-        
-        console.log("\n✓ OCR extraction successful!");
-        
       } catch (ocrError) {
-        console.error("\n❌ OCR also failed:", ocrError.message);
-        
         const emptyResume = await Resume.create({
-          userId: userId,
+          userId,
           title: title.trim(),
           uploadedFile: {
             originalName: req.file.originalname,
@@ -137,16 +129,8 @@ export const uploadResume = async (req, res) => {
             size: req.file.size,
             mimetype: req.file.mimetype
           },
-          professional_summary: "⚠️ Could not extract text from this PDF. Please fill in your details manually below.",
-          personal_info: {
-            full_name: "",
-            email: "",
-            phone: "",
-            location: "",
-            profession: "",
-            linkedin: "",
-            website: "",
-          },
+          professional_summary: "⚠️ Text extraction failed. Fill manually.",
+          personal_info: { full_name: "", email: "", phone: "", location: "", profession: "", linkedin: "", website: "" },
           experience: [],
           education: [],
           project: [],
@@ -159,38 +143,28 @@ export const uploadResume = async (req, res) => {
         return res.status(200).json({
           success: true,
           resumeId: emptyResume._id,
-          message: "Resume uploaded but text extraction failed. Please fill in details manually.",
-          warning: "Both PDF parsing and OCR failed."
+          message: "Uploaded. Fill details manually.",
+          warning: true
         });
       }
     }
 
-    console.log("\n🤖 Step 3: Parsing extracted text with AI...");
+    console.log("🤖 AI parsing with Groq...");
     
     let parsedData = {
       professional_summary: "",
-      personal_info: {
-        full_name: "",
-        email: "",
-        phone: "",
-        location: "",
-        profession: "",
-        linkedin: "",
-        website: "",
-      },
+      personal_info: { full_name: "", email: "", phone: "", location: "", profession: "", linkedin: "", website: "" },
       experience: [],
       education: [],
       project: [],
-      skills: [],
+      skills: []
     };
 
     try {
-      const aiResponse = await ai.chat.completions.create({
-        model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-        messages: [
-          {
-            role: "system",
-            content: `You are a professional resume parser. Extract structured data from resume text and return ONLY valid JSON.
+      const aiResponse = await callAIWithRetry([
+        {
+          role: "system",
+          content: `You are a professional resume parser. Extract structured data from resume text and return ONLY valid JSON.
 
 CRITICAL RULES:
 1. Your response must be ONLY a JSON object
@@ -245,45 +219,32 @@ IMPORTANT:
 - Extract phone numbers in international format if possible
 - List skills as individual items in array
 - Return ONLY the JSON object, nothing else`
-          },
-          {
-            role: "user",
-            content: `Parse this resume text and extract all information in JSON format:\n\n${extractedText}`
-          }
-        ],
-        temperature: 0.2,
-        max_tokens: 2000,
-      });
+        },
+        { role: "user", content: `Parse this resume text and extract all information in JSON format:\n\n${extractedText}` }
+      ]);
 
       let aiText = aiResponse.choices[0].message.content.trim();
       console.log("✓ AI response received");
-      console.log("  Response length:", aiText.length);
       
+      // Clean up response
       aiText = aiText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
       
       const jsonMatch = aiText.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        aiText = jsonMatch[0];
-      }
-      
-      console.log("  Cleaned response (first 300 chars):", aiText.substring(0, 300));
+      if (jsonMatch) aiText = jsonMatch[0];
       
       const aiParsedData = JSON.parse(aiText);
       console.log("✓ JSON parsed successfully");
       
-      console.log("\n📊 Extracted Data Summary:");
-      console.log("  ├─ Name:", aiParsedData.personal_info?.full_name || "❌ Not found");
-      console.log("  ├─ Email:", aiParsedData.personal_info?.email || "❌ Not found");
-      console.log("  ├─ Phone:", aiParsedData.personal_info?.phone || "❌ Not found");
-      console.log("  ├─ Location:", aiParsedData.personal_info?.location || "❌ Not found");
-      console.log("  ├─ Profession:", aiParsedData.personal_info?.profession || "❌ Not found");
-      console.log("  ├─ Experience:", aiParsedData.experience?.length || 0, "entries");
-      console.log("  ├─ Education:", aiParsedData.education?.length || 0, "entries");
-      console.log("  ├─ Projects:", aiParsedData.project?.length || 0, "entries");
-      console.log("  └─ Skills:", aiParsedData.skills?.length || 0, "skills");
+      console.log("\n📊 Extracted Data:");
+      console.log("  Name:", aiParsedData.personal_info?.full_name || "❌");
+      console.log("  Email:", aiParsedData.personal_info?.email || "❌");
+      console.log("  Phone:", aiParsedData.personal_info?.phone || "❌");
+      console.log("  Experience:", aiParsedData.experience?.length || 0, "entries");
+      console.log("  Education:", aiParsedData.education?.length || 0, "entries");
+      console.log("  Skills:", aiParsedData.skills?.length || 0, "skills");
       
       parsedData = {
-        professional_summary: aiParsedData.professional_summary || "Experienced professional with diverse background",
+        professional_summary: aiParsedData.professional_summary || "Experienced professional",
         personal_info: {
           full_name: aiParsedData.personal_info?.full_name || "",
           email: aiParsedData.personal_info?.email || "",
@@ -291,23 +252,23 @@ IMPORTANT:
           location: aiParsedData.personal_info?.location || "",
           profession: aiParsedData.personal_info?.profession || "",
           linkedin: aiParsedData.personal_info?.linkedin || "",
-          website: aiParsedData.personal_info?.website || "",
+          website: aiParsedData.personal_info?.website || ""
         },
         experience: Array.isArray(aiParsedData.experience) ? aiParsedData.experience : [],
         education: Array.isArray(aiParsedData.education) ? aiParsedData.education : [],
         project: Array.isArray(aiParsedData.project) ? aiParsedData.project : [],
-        skills: Array.isArray(aiParsedData.skills) ? aiParsedData.skills : [],
+        skills: Array.isArray(aiParsedData.skills) ? aiParsedData.skills : []
       };
       
     } catch (aiError) {
-      console.error("\n❌ AI parsing error:", aiError.message);
-      console.error("   Will save with extracted text but empty parsed data");
+      console.error("❌ AI parsing error:", aiError.message);
+      console.error("   Will save with empty parsed data");
     }
 
-    console.log("\n💾 Step 4: Saving to database...");
+    console.log("💾 Saving to database...");
     
     const newResume = await Resume.create({
-      userId: userId,
+      userId,
       title: title.trim(),
       uploadedFile: {
         originalName: req.file.originalname,
@@ -327,17 +288,15 @@ IMPORTANT:
       public: false
     });
     
-    console.log("\n✅ SUCCESS! Resume saved to database!");
-    console.log("   Resume ID:", newResume._id);
+    console.log("✅ SUCCESS! Resume saved!");
+    console.log("   ID:", newResume._id);
     console.log("   Title:", newResume.title);
-    console.log("   Saved name:", newResume.personal_info?.full_name || "Empty");
-    console.log("   Saved email:", newResume.personal_info?.email || "Empty");
     console.log("=====================================\n");
 
     return res.status(200).json({
       success: true,
       resumeId: newResume._id,
-      message: `"${newResume.title}" uploaded and parsed successfully!`,
+      message: `"${newResume.title}" uploaded successfully!`,
       stats: {
         textExtracted: extractedText.length,
         pages: pdfPageCount || 1,
@@ -348,21 +307,14 @@ IMPORTANT:
           phone: !!parsedData.personal_info?.phone,
           experience: parsedData.experience?.length || 0,
           education: parsedData.education?.length || 0,
-          skills: parsedData.skills?.length || 0,
+          skills: parsedData.skills?.length || 0
         }
       }
     });
 
   } catch (error) {
-    console.error("\n❌❌❌ UPLOAD ERROR ❌❌❌");
-    console.error("Error:", error.message);
-    console.error("Stack:", error.stack);
-    console.error("=====================================\n");
-    
-    return res.status(500).json({ 
-      success: false,
-      message: "Upload failed: " + error.message
-    });
+    console.error("❌ UPLOAD ERROR:", error.message);
+    return res.status(500).json({ success: false, message: "Upload failed: " + error.message });
   }
 };
 
@@ -371,41 +323,25 @@ export const enhanceProfessionalSummary = async (req, res) => {
     const { userContent } = req.body;
 
     if (!userContent || userContent.trim() === "") {
-      return res.status(400).json({
-        success: false,
-        message: "Please provide content to enhance"
-      });
+      return res.status(400).json({ success: false, message: "Provide content to enhance" });
     }
 
-    const aiResponse = await ai.chat.completions.create({
-      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: `You are a professional resume writer. Enhance the given professional summary to make it more compelling, professional, and impactful. Keep it concise (2-4 sentences, max 100 words). Use strong action words and industry-relevant terminology. Highlight key strengths, skills, and achievements. Make it ATS-friendly. Maintain a professional tone. Focus on value proposition and unique qualities. Return ONLY the enhanced summary text, no explanations.`
-        },
-        {
-          role: "user",
-          content: userContent
-        }
-      ],
-      temperature: 0.7,
-      max_tokens: 200,
-    });
-
-    const enhancedContent = aiResponse.choices[0].message.content.trim();
+    const aiResponse = await callAIWithRetry([
+      {
+        role: "system",
+        content: `You are a professional resume writer. Enhance the given professional summary to make it more compelling, professional, and impactful. Keep it concise (2-4 sentences, max 100 words). Use strong action words and industry-relevant terminology. Highlight key strengths, skills, and achievements. Make it ATS-friendly. Maintain a professional tone. Focus on value proposition and unique qualities. Return ONLY the enhanced summary text, no explanations.`
+      },
+      { role: "user", content: userContent }
+    ]);
 
     return res.status(200).json({
       success: true,
-      enhancedContent: enhancedContent,
+      enhancedContent: aiResponse.choices[0].message.content.trim(),
       message: "Summary enhanced successfully!"
     });
 
   } catch (error) {
-    return res.status(500).json({
-      success: false,
-      message: "Enhancement failed: " + error.message
-    });
+    return res.status(500).json({ success: false, message: "Enhancement failed: " + error.message });
   }
 };
 
@@ -414,18 +350,13 @@ export const enhanceExperience = async (req, res) => {
     const { userContent } = req.body;
 
     if (!userContent || userContent.trim() === "") {
-      return res.status(400).json({
-        success: false,
-        message: "Please provide content to enhance"
-      });
+      return res.status(400).json({ success: false, message: "Provide content to enhance" });
     }
 
-    const aiResponse = await ai.chat.completions.create({
-      model: process.env.OPENAI_MODEL || "gpt-4o-mini",
-      messages: [
-        {
-          role: "system",
-          content: `You are a professional resume writer. Your task is to enhance job experience descriptions to make them more professional, impactful, and ATS-friendly.
+    const aiResponse = await callAIWithRetry([
+      {
+        role: "system",
+        content: `You are a professional resume writer. Enhance job experience descriptions to make them more professional, impactful, and ATS-friendly.
 
 INSTRUCTIONS:
 1. Expand the content with more details and professional language
@@ -437,42 +368,18 @@ INSTRUCTIONS:
 7. Aim for 6-10 detailed bullet points
 8. Make it comprehensive and detailed, not short or minimal
 9. Keep professional tone throughout
-10. Return ONLY the enhanced description text with bullet points, no explanations
-
-EXAMPLE INPUT:
-"Developed web applications using React and Node.js"
-
-EXAMPLE OUTPUT:
-- Architected and developed 15+ scalable web applications using React.js, Node.js, and MongoDB, serving over 100,000+ active users
-- Implemented RESTful APIs and microservices architecture, improving system performance by 40% and reducing server response time by 250ms
-- Led frontend development using React.js with Redux for state management, creating reusable component libraries that reduced development time by 30%
-- Collaborated with cross-functional teams of 8+ members using Agile methodologies, ensuring timely delivery of sprint goals with 95% completion rate
-- Integrated third-party APIs including payment gateways (Stripe, PayPal), authentication services (OAuth, JWT), and cloud storage solutions (AWS S3)
-- Optimized application performance through code splitting, lazy loading, and caching strategies, achieving 90+ Lighthouse scores
-- Conducted code reviews and mentored 3 junior developers, improving code quality and adherence to best practices
-- Implemented comprehensive testing strategies using Jest and React Testing Library, maintaining 85%+ code coverage`
-        },
-        {
-          role: "user",
-          content: userContent
-        }
-      ],
-      temperature: 0.7,
-      max_tokens: 800,
-    });
-
-    const enhancedContent = aiResponse.choices[0].message.content.trim();
+10. Return ONLY the enhanced description text with bullet points, no explanations`
+      },
+      { role: "user", content: userContent }
+    ]);
 
     return res.status(200).json({
       success: true,
-      enhancedContent: enhancedContent,
+      enhancedContent: aiResponse.choices[0].message.content.trim(),
       message: "Experience enhanced successfully!"
     });
 
   } catch (error) {
-    return res.status(500).json({
-      success: false,
-      message: "Enhancement failed: " + error.message
-    });
+    return res.status(500).json({ success: false, message: "Enhancement failed: " + error.message });
   }
 };
