@@ -1,7 +1,7 @@
 import axios from "axios";
 
 const api = axios.create({
-  baseURL: "https://resume-builder-server-drab.vercel.app",
+  baseURL: import.meta.env.VITE_API_URL || "http://localhost:3000",
 });
 
 api.interceptors.request.use(
